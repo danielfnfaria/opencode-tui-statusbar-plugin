@@ -160,7 +160,6 @@ if (mode === "install") {
 }
 
 if (actions.length === 0) {
-  console.log("nothing to do: already " + (mode === "install" ? "installed" : "removed") + ".");
   process.exit(4);
 }
 
@@ -183,8 +182,13 @@ set +e
 run_node 0
 RC=$?
 set -e
-if [[ $RC -eq 4 ]]; then exit 0; fi
-if [[ $RC -ne 0 ]]; then exit $RC; fi
+if [[ $RC -ne 0 && $RC -ne 4 ]]; then exit $RC; fi
+DEST_EXISTS=0
+[[ -f "$DEST" ]] && DEST_EXISTS=1
+if [[ $RC -eq 4 && $COPY_NEEDED -eq 0 && ! ( $REMOVE -eq 1 && $DEST_EXISTS -eq 1 ) ]]; then
+  echo "nothing to do: already $([[ $REMOVE -eq 1 ]] && echo removed || echo installed)."
+  exit 0
+fi
 
 if [[ $REMOVE -eq 0 && $COPY_NEEDED -eq 1 ]]; then
   echo "[copy] $SRC -> $DEST"
@@ -215,7 +219,7 @@ if [[ $REMOVE -eq 1 && -f "$DEST" ]]; then
   rm -f "$DEST"
 fi
 
-run_node 1 || true
+if [[ $RC -eq 0 ]]; then run_node 1; fi
 
 if [[ $REMOVE -eq 0 ]]; then
   echo "restart opencode for the plugin to load (config is not hot-reloaded)."
