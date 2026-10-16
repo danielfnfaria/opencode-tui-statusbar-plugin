@@ -1,0 +1,14 @@
+{
+  "name": "opencode-tui-statusbar-plugin",
+  "version": "0.1.0",
+  "description": "agtop-style status bar for the opencode TUI: running sub-agents, session tokens/cost and model context limits, plus an idempotent installer.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "files": [
+    "plugin"
+  ],
+  "scripts": {
+    "check": "npx -y esbuild plugin/statusbar.tsx --loader:.tsx=tsx --jsx=automatic --jsx-import-source=@opentui/solid --outfile=/dev/null"
+  }
+}
