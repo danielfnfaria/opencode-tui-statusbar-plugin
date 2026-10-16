@@ -148,37 +148,52 @@ const tui: TuiPlugin = async (api) => {
   const statusColor = (theme: any, status: string) =>
     status === "busy" ? theme.warning : status === "retry" ? theme.error : theme.success
 
-  // ---- compact line, right of the prompt ----
+  // ---- status bar on its own line, below the native prompt info line ----
+  // The host renders `session_prompt` in replace mode: we re-render the original
+  // Prompt (forwarding ref/on_submit so focus and scroll keep working) and put
+  // our bar in a separate line underneath it.
+  const StatusBar = (sid: string) => {
+    const theme = () => api.theme.current
+    const { tot, cost, ctx, modelID } = totals(sid)
+    const limit = modelLimit(modelID)
+    const pct = limit?.context ? ctx / limit.context : 0
+    const ctxFg = () => (pct > 0.8 ? theme().error : pct > 0.6 ? theme().warning : theme().success)
+    const kids = childrenOf(sid)
+    const busy = kids.some((k) => statusOf(k.id) !== "idle")
+    const branch = api.state.vcs?.branch
+    return (
+      <box flexDirection="row" gap={1} paddingLeft={1}>
+        {branch ? <text fg={theme().textMuted}>⎇ {branch}</text> : null}
+        {modelID ? <text fg={theme().text}>{modelID}</text> : null}
+        {limit?.context ? (
+          <text fg={ctxFg()}>
+            ctx {bar(pct)} {Math.round(pct * 100)}% {fmtTok(ctx)}/{fmtTok(limit.context)}
+          </text>
+        ) : null}
+        <text fg={theme().textMuted}>
+          ↓{fmtTok(tot.input + tot.cache.read + tot.cache.write)} ↑{fmtTok(tot.output + tot.reasoning)}
+        </text>
+        <text fg={theme().textMuted}>{fmtCost(cost)}</text>
+        <text fg={busy ? theme().warning : theme().textMuted}>{kids.length} ag</text>
+      </box>
+    )
+  }
+
   api.slots.register({
     order: 60,
     slots: {
-      session_prompt_right(_ctx: any, props: { session_id: string }) {
-        const theme = () => api.theme.current
-        const sid = props.session_id
-        const { tot, cost, ctx, modelID } = totals(sid)
-        const limit = modelLimit(modelID)
-        const pct = limit?.context ? ctx / limit.context : 0
-        const ctxFg = () =>
-          pct > 0.8 ? theme().error : pct > 0.6 ? theme().warning : theme().success
-        const kids = childrenOf(sid)
-        const busy = kids.some((k) => statusOf(k.id) !== "idle")
-        const branch = api.state.vcs?.branch
+      session_prompt(_ctx: any, props: any) {
+        const Prompt = api.ui.Prompt
         return (
-          <box flexDirection="row" gap={1}>
-            {branch ? <text fg={theme().textMuted}>⎇ {branch}</text> : null}
-            {modelID ? <text fg={theme().text}>{modelID}</text> : null}
-            {limit?.context ? (
-              <text fg={ctxFg()}>
-                ctx {bar(pct)} {Math.round(pct * 100)}% {fmtTok(ctx)}/{fmtTok(limit.context)}
-              </text>
-            ) : null}
-            <text fg={theme().textMuted}>
-              ↓{fmtTok(tot.input + tot.cache.read + tot.cache.write)} ↑{fmtTok(tot.output + tot.reasoning)}
-            </text>
-            <text fg={theme().textMuted}>{fmtCost(cost)}</text>
-            <text fg={busy ? theme().warning : theme().textMuted}>
-              {kids.length} ag
-            </text>
+          <box flexDirection="column">
+            <Prompt
+              sessionID={props.session_id}
+              visible={props.visible}
+              disabled={props.disabled}
+              onSubmit={props.on_submit}
+              ref={props.ref}
+            />
+            {StatusBar(props.session_id)}
           </box>
         )
       },
