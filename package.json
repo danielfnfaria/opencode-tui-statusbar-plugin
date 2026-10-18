@@ -1,7 +1,7 @@
 {
   "name": "opencode-tui-statusbar-plugin",
-  "version": "0.1.0",
-  "description": "agtop-style status bar for the opencode TUI: running sub-agents, session tokens/cost and model context limits, plus an idempotent installer.",
+  "version": "0.2.0",
+  "description": "agtop-style status bar for the opencode TUI: running sub-agents, session tokens/cost, model context limits and the 5h/7d plan usage windows, plus an idempotent installer.",
   "type": "module",
   "private": true,
   "license": "MIT",

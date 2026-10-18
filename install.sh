@@ -8,7 +8,7 @@
 #   ./install.sh --config-dir D  # target config dir (default: $OPENCODE_CONFIG_DIR or ~/.config/opencode)
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$ROOT/plugin/statusbar.tsx"
 INSTALLED_NAME="opencode-tui-statusbar.tsx"

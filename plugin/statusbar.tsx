@@ -1,12 +1,33 @@
 /** @jsxImportSource @opentui/solid */
-// opencode-tui-statusbar-plugin v0.1.0
+// opencode-tui-statusbar-plugin v0.2.0
 // Installed by install.sh — re-run the installer to update, install.sh --remove to uninstall.
 // agtop-style status for the opencode TUI.
 // Compact line next to the prompt + `/top` (or palette) modal with per-agent detail.
-// Data sources: api.state (messages/tokens/cost/status/vcs/providers) and session events.
+// Data sources: api.state (messages/tokens/cost/status/vcs/providers), session events, and the
+// plan usage file written by `agtop setup` (<config dir>/agtop/usage.json: 5h/7d windows).
 import type { TuiPlugin } from "@opencode-ai/plugin/tui"
+import { readFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
+import { createSignal } from "solid-js"
 
 const id = "agtop.status"
+
+// ---- palette (truecolor; fg accepts #RRGGBB) ----------------------------------------------
+// Catppuccin Mocha-flavored accents, matching the Claude status line.
+const C = {
+  pink: "#f5c2e7", // branch
+  mauve: "#cba6f7", // 7d label
+  blue: "#89b4fa", // model
+  lav: "#b4befe", // 5h label
+  teal: "#94e2d5", // tokens in
+  peach: "#fab387", // tokens out
+  green: "#a6e3a1", // low usage
+  yellow: "#f9e2af", // mid usage
+  red: "#f38ba8", // high usage
+  dim: "#6c7086", // muted
+  overlay: "#45475a", // empty bars
+} as const
 
 type Tokens = {
   input: number
@@ -20,6 +41,12 @@ type AnySession = {
   parentID?: string
   time?: { created?: number; updated?: number }
 }
+type UsageWindow = { percent: number; resetsAt: number }
+type Usage = { updatedAt: number; fiveHour?: UsageWindow; sevenDay?: UsageWindow }
+
+const USAGE_STALE_MS = 10 * 60_000 // matches agtop: older than this is stale
+const USAGE_BAR_WIDTH = 8
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
 function fmtTok(n: number): string {
   if (!Number.isFinite(n)) return "-"
@@ -35,10 +62,49 @@ function fmtCost(n: number): string {
   return "$" + n.toFixed(4)
 }
 
-function bar(pct: number, width = 10): string {
+function bar(pct: number, width = USAGE_BAR_WIDTH): { filled: string; empty: string } {
   const clamped = Math.max(0, Math.min(1, pct))
-  const filled = Math.round(clamped * width)
-  return "█".repeat(filled) + "░".repeat(width - filled)
+  const f = Math.round(clamped * width)
+  return { filled: "█".repeat(f), empty: "░".repeat(width - f) }
+}
+
+const usageColor = (p: number): string => (p >= 80 ? C.red : p >= 50 ? C.yellow : C.green)
+
+function resetHHMM(ms: number): string {
+  const d = new Date(ms)
+  return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0")
+}
+
+function resetDay(ms: number, now: number): string {
+  return ms - now < 86_400_000 ? resetHHMM(ms) : WEEKDAYS[new Date(ms).getDay()]
+}
+
+// ---- plan usage (5h / 7d), read from agtop's usage.json -----------------------------------
+function usageFilePath(): string {
+  if (process.env.AGTOP_USAGE_FILE) return process.env.AGTOP_USAGE_FILE
+  const dir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude")
+  return join(dir, "agtop", "usage.json")
+}
+
+function normWindow(v: any): UsageWindow | undefined {
+  if (!v || typeof v !== "object") return undefined
+  if (typeof v.percent !== "number" || !Number.isFinite(v.percent)) return undefined
+  const w: UsageWindow = { percent: Math.min(100, Math.max(0, v.percent)), resetsAt: 0 }
+  if (typeof v.resetsAt === "number" && Number.isFinite(v.resetsAt)) w.resetsAt = v.resetsAt
+  return w
+}
+
+function readUsage(): Usage | null {
+  try {
+    const v = JSON.parse(readFileSync(usageFilePath(), "utf8"))
+    if (!v || typeof v !== "object" || typeof v.updatedAt !== "number") return null
+    const fiveHour = normWindow(v.fiveHour)
+    const sevenDay = normWindow(v.sevenDay)
+    if (!fiveHour && !sevenDay) return null
+    return { updatedAt: v.updatedAt, fiveHour, sevenDay }
+  } catch {
+    return null // missing/invalid: the bar falls back to `5h —  7d —`
+  }
 }
 
 const tui: TuiPlugin = async (api) => {
@@ -69,6 +135,11 @@ const tui: TuiPlugin = async (api) => {
   api.lifecycle.onDispose(() => {
     for (const u of unsubs) u()
   })
+
+  // Plan usage: a low-frequency poll; the file is tiny and only changes with Claude activity.
+  const [usage, setUsage] = createSignal<Usage | null>(readUsage())
+  const usageTimer = setInterval(() => setUsage(readUsage()), 5_000)
+  api.lifecycle.onDispose(() => clearInterval(usageTimer))
 
   const currentSessionID = (): string | undefined => {
     const route = api.route.current
@@ -148,6 +219,33 @@ const tui: TuiPlugin = async (api) => {
   const statusColor = (theme: any, status: string) =>
     status === "busy" ? theme.warning : status === "retry" ? theme.error : theme.success
 
+  // One usage window (`5h ██░░░░░░  11% ↻14:00`), glued in a gap-0 row so cells stay tight.
+  const UsageWindowView = (props: {
+    label: string
+    labelColor: string
+    w?: UsageWindow
+    resetText: (ms: number) => string
+    dim: boolean
+  }) => {
+    const w = props.w
+    // A window whose reset already passed (since the last write) has an unknown percent.
+    if (!w || (w.resetsAt !== 0 && w.resetsAt <= Date.now())) {
+      return <text fg={C.dim}>{props.label} —</text>
+    }
+    const col = props.dim ? C.dim : usageColor(w.percent)
+    const b = bar(w.percent / 100)
+    const reset = w.resetsAt ? " ↻" + props.resetText(w.resetsAt) : ""
+    return (
+      <box flexDirection="row" gap={0}>
+        <text fg={props.dim ? C.dim : props.labelColor}>{props.label} </text>
+        <text fg={col}>{b.filled}</text>
+        <text fg={C.overlay}>{b.empty}</text>
+        <text fg={col}> {String(Math.round(w.percent)).padStart(3)}%</text>
+        {reset ? <text fg={C.dim}>{reset}</text> : null}
+      </box>
+    )
+  }
+
   // ---- status bar on its own line, below the native prompt info line ----
   // The host renders `session_prompt` in replace mode: we re-render the original
   // Prompt (forwarding ref/on_submit so focus and scroll keep working) and put
@@ -157,24 +255,55 @@ const tui: TuiPlugin = async (api) => {
     const { tot, cost, ctx, modelID } = totals(sid)
     const limit = modelLimit(modelID)
     const pct = limit?.context ? ctx / limit.context : 0
-    const ctxFg = () => (pct > 0.8 ? theme().error : pct > 0.6 ? theme().warning : theme().success)
+    const ctxColor = pct > 0.8 ? C.red : pct > 0.6 ? C.yellow : C.green
+    const cbar = bar(pct)
     const kids = childrenOf(sid)
     const busy = kids.some((k) => statusOf(k.id) !== "idle")
     const branch = api.state.vcs?.branch
+    const u = usage()
+    const now = Date.now()
+    const stale = !!u && now - u.updatedAt > USAGE_STALE_MS
     return (
       <box flexDirection="row" gap={1} paddingLeft={1}>
-        {branch ? <text fg={theme().textMuted}>⎇ {branch}</text> : null}
-        {modelID ? <text fg={theme().text}>{modelID}</text> : null}
+        {branch ? <text fg={C.pink}>⎇ {branch}</text> : null}
+        {modelID ? <text fg={C.blue}>{modelID}</text> : null}
         {limit?.context ? (
-          <text fg={ctxFg()}>
-            ctx {bar(pct)} {Math.round(pct * 100)}% {fmtTok(ctx)}/{fmtTok(limit.context)}
-          </text>
+          <box flexDirection="row" gap={0}>
+            <text fg={C.dim}>ctx </text>
+            <text fg={ctxColor}>{cbar.filled}</text>
+            <text fg={C.overlay}>{cbar.empty}</text>
+            <text fg={ctxColor}>
+              {" " + Math.round(pct * 100) + "% " + fmtTok(ctx) + "/" + fmtTok(limit.context)}
+            </text>
+          </box>
         ) : null}
-        <text fg={theme().textMuted}>
-          ↓{fmtTok(tot.input + tot.cache.read + tot.cache.write)} ↑{fmtTok(tot.output + tot.reasoning)}
-        </text>
-        <text fg={theme().textMuted}>{fmtCost(cost)}</text>
-        <text fg={busy ? theme().warning : theme().textMuted}>{kids.length} ag</text>
+        {u ? (
+          <UsageWindowView
+            label="5h"
+            labelColor={C.lav}
+            w={u.fiveHour}
+            resetText={resetHHMM}
+            dim={stale}
+          />
+        ) : (
+          <text fg={C.dim}>5h —</text>
+        )}
+        {u ? (
+          <UsageWindowView
+            label="7d"
+            labelColor={C.mauve}
+            w={u.sevenDay}
+            resetText={(ms) => resetDay(ms, now)}
+            dim={stale}
+          />
+        ) : (
+          <text fg={C.dim}>7d —</text>
+        )}
+        {stale ? <text fg={C.dim}>(stale)</text> : null}
+        <text fg={C.teal}>↓{fmtTok(tot.input + tot.cache.read + tot.cache.write)}</text>
+        <text fg={C.peach}>↑{fmtTok(tot.output + tot.reasoning)}</text>
+        <text fg={C.yellow}>{fmtCost(cost)}</text>
+        <text fg={busy ? theme().warning : C.dim}>{kids.length} ag</text>
       </box>
     )
   }
@@ -207,12 +336,15 @@ const tui: TuiPlugin = async (api) => {
     if (!sid) {
       return (
         <box flexDirection="column" gap={1} padding={1}>
-          <text fg={theme().textMuted}>Abra uma sessão para ver os agentes.</text>
+          <text fg={C.dim}>Abra uma sessão para ver os agentes.</text>
         </box>
       )
     }
     const root = totals(sid)
     const kids = childrenOf(sid)
+    const u = usage()
+    const now = Date.now()
+    const stale = !!u && now - u.updatedAt > USAGE_STALE_MS
     const line = (s: AnySession) => {
       const st = statusOf(s.id)
       const t = totals(s.id)
@@ -223,22 +355,43 @@ const tui: TuiPlugin = async (api) => {
           <text fg={statusColor(theme(), st)}>{st.padEnd(5)}</text>
           <text fg={theme().text}>{(s.title ?? s.id).slice(0, 40).padEnd(40)}</text>
           <text fg={theme().textMuted}>{(t.modelID ?? "-").padEnd(24)}</text>
-          <text fg={theme().textMuted}>
-            ↓{fmtTok(t.tot.input + t.tot.cache.read + t.tot.cache.write)} ↑
-            {fmtTok(t.tot.output + t.tot.reasoning)}
+          <text fg={C.teal}>
+            ↓{fmtTok(t.tot.input + t.tot.cache.read + t.tot.cache.write)}
           </text>
-          <text fg={theme().textMuted}>{fmtCost(t.cost).padEnd(8)}</text>
+          <text fg={C.peach}>↑{fmtTok(t.tot.output + t.tot.reasoning)}</text>
+          <text fg={C.yellow}>{fmtCost(t.cost).padEnd(8)}</text>
           <text fg={theme().textMuted}>{tool ?? ""}</text>
         </box>
       )
     }
     return (
       <box flexDirection="column" gap={1} padding={1}>
-        <text fg={theme().text}>
-          sessão: {known.get(sid)?.title ?? sid} · ctx {fmtTok(root.ctx)}
-          {modelLimit(root.modelID) ? "/" + fmtTok(modelLimit(root.modelID)!.context) : ""} ·{" "}
-          {fmtCost(root.cost)}
-        </text>
+        <box flexDirection="row" gap={1}>
+          <text fg={theme().text}>
+            sessão: {known.get(sid)?.title ?? sid} · ctx {fmtTok(root.ctx)}
+            {modelLimit(root.modelID) ? "/" + fmtTok(modelLimit(root.modelID)!.context) : ""} ·{" "}
+            {fmtCost(root.cost)}
+          </text>
+        </box>
+        <box flexDirection="row" gap={1}>
+          <text fg={C.dim}>
+            plano {stale ? "(stale) " : ""}·{" "}
+          </text>
+          <UsageWindowView
+            label="5h"
+            labelColor={C.lav}
+            w={u?.fiveHour}
+            resetText={resetHHMM}
+            dim={stale}
+          />
+          <UsageWindowView
+            label="7d"
+            labelColor={C.mauve}
+            w={u?.sevenDay}
+            resetText={(ms) => resetDay(ms, now)}
+            dim={stale}
+          />
+        </box>
         <text fg={theme().textMuted}>
           {"● status  agente/sub-agente                          modelo                    tokens      custo    última tool"}
         </text>
