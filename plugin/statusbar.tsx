@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-// opencode-tui-statusbar-plugin v0.2.0
+// opencode-tui-statusbar-plugin v0.3.0
 // Installed by install.sh — re-run the installer to update, install.sh --remove to uninstall.
 // agtop-style status for the opencode TUI.
 // Compact line next to the prompt + `/top` (or palette) modal with per-agent detail.
@@ -62,11 +62,43 @@ function fmtCost(n: number): string {
   return "$" + n.toFixed(4)
 }
 
-function bar(pct: number, width = USAGE_BAR_WIDTH): { filled: string; empty: string } {
-  const clamped = Math.max(0, Math.min(1, pct))
-  const f = Math.round(clamped * width)
-  return { filled: "█".repeat(f), empty: "░".repeat(width - f) }
+// Gradient bar: filled cells run green → yellow → red across the width, empty cells in overlay
+// grey. Mirrors bar() in ~/.claude/statusline.sh so both bars read identically.
+const BAR_GREEN: number[] = [166, 227, 161]
+const BAR_YELLOW: number[] = [249, 226, 175]
+const BAR_RED: number[] = [243, 139, 168]
+
+function barCellColor(index: number, width: number): string {
+  const t = width === 1 ? 0 : (index * 100) / (width - 1)
+  const [from, to] = t < 50 ? [BAR_GREEN, BAR_YELLOW] : [BAR_YELLOW, BAR_RED]
+  const k = t < 50 ? t / 50 : (t - 50) / 50
+  const rgb = from.map((v, i) => Math.round(v + (to[i] - v) * k).toString(16).padStart(2, "0"))
+  return "#" + rgb.join("")
 }
+
+function barCells(pct: number, width = USAGE_BAR_WIDTH): Array<{ char: string; color: string }> {
+  const p = Math.max(0, Math.min(100, pct))
+  let filled = Math.round((p * width) / 100)
+  if (p > 0 && filled === 0) filled = 1
+  return Array.from({ length: width }, (_, i) =>
+    i < filled ? { char: "▰", color: barCellColor(i, width) } : { char: "▱", color: C.overlay },
+  )
+}
+
+// `▰▱` bar, one cell per <text> so each can carry its own gradient color.
+const Bar = (props: { pct: number; width?: number }) => (
+  <box flexDirection="row" gap={0}>
+    {barCells(props.pct, props.width).map((cell) => (
+      <text fg={cell.color}>{cell.char}</text>
+    ))}
+  </box>
+)
+
+// Group separator; the row's gap={1} makes it read as `a │ b`.
+const Sep = () => <text fg={C.overlay}>│</text>
+
+// Compact model label: last `-` segment of the id (`deepseek-v4.1-flash` → `flash`).
+const shortModel = (modelID: string): string => modelID.split("-").pop() || modelID
 
 const usageColor = (p: number): string => (p >= 80 ? C.red : p >= 50 ? C.yellow : C.green)
 
@@ -232,15 +264,12 @@ const tui: TuiPlugin = async (api) => {
     if (!w || (w.resetsAt !== 0 && w.resetsAt <= Date.now())) {
       return <text fg={C.dim}>{props.label} —</text>
     }
-    const col = props.dim ? C.dim : usageColor(w.percent)
-    const b = bar(w.percent / 100)
     const reset = w.resetsAt ? " ↻" + props.resetText(w.resetsAt) : ""
     return (
-      <box flexDirection="row" gap={0}>
-        <text fg={props.dim ? C.dim : props.labelColor}>{props.label} </text>
-        <text fg={col}>{b.filled}</text>
-        <text fg={C.overlay}>{b.empty}</text>
-        <text fg={col}> {String(Math.round(w.percent)).padStart(3)}%</text>
+      <box flexDirection="row" gap={1}>
+        <text fg={props.dim ? C.dim : props.labelColor}>{props.label}</text>
+        <Bar pct={w.percent} />
+        <text fg={props.dim ? C.dim : usageColor(w.percent)}>{Math.round(w.percent) + "%"}</text>
         {reset ? <text fg={C.dim}>{reset}</text> : null}
       </box>
     )
@@ -256,54 +285,59 @@ const tui: TuiPlugin = async (api) => {
     const limit = modelLimit(modelID)
     const pct = limit?.context ? ctx / limit.context : 0
     const ctxColor = pct > 0.8 ? C.red : pct > 0.6 ? C.yellow : C.green
-    const cbar = bar(pct)
     const kids = childrenOf(sid)
     const busy = kids.some((k) => statusOf(k.id) !== "idle")
     const branch = api.state.vcs?.branch
     const u = usage()
     const now = Date.now()
     const stale = !!u && now - u.updatedAt > USAGE_STALE_MS
-    return (
-      <box flexDirection="row" gap={1} paddingLeft={1}>
-        {branch ? <text fg={C.pink}>⎇ {branch}</text> : null}
-        {modelID ? <text fg={C.blue}>{modelID}</text> : null}
-        {limit?.context ? (
-          <box flexDirection="row" gap={0}>
-            <text fg={C.dim}>ctx </text>
-            <text fg={ctxColor}>{cbar.filled}</text>
-            <text fg={C.overlay}>{cbar.empty}</text>
-            <text fg={ctxColor}>
-              {" " + Math.round(pct * 100) + "% " + fmtTok(ctx) + "/" + fmtTok(limit.context)}
-            </text>
-          </box>
-        ) : null}
-        {u ? (
-          <UsageWindowView
-            label="5h"
-            labelColor={C.lav}
-            w={u.fiveHour}
-            resetText={resetHHMM}
-            dim={stale}
-          />
-        ) : (
-          <text fg={C.dim}>5h —</text>
-        )}
-        {u ? (
-          <UsageWindowView
-            label="7d"
-            labelColor={C.mauve}
-            w={u.sevenDay}
-            resetText={(ms) => resetDay(ms, now)}
-            dim={stale}
-          />
-        ) : (
-          <text fg={C.dim}>7d —</text>
-        )}
-        {stale ? <text fg={C.dim}>(stale)</text> : null}
+    // Groups joined by a `│` separator — compact, no `·`, no `ctx` label (proposta B).
+    const groups: unknown[] = []
+    if (branch) groups.push(<text fg={C.pink}>⎇ {branch}</text>)
+    if (modelID) groups.push(<text fg={C.blue}>{shortModel(modelID)}</text>)
+    if (limit?.context)
+      groups.push(
+        <box flexDirection="row" gap={1}>
+          <Bar pct={pct * 100} />
+          <text fg={ctxColor}>{Math.round(pct * 100) + "%"}</text>
+        </box>,
+      )
+    groups.push(
+      u ? (
+        <UsageWindowView label="5h" labelColor={C.lav} w={u.fiveHour} resetText={resetHHMM} dim={stale} />
+      ) : (
+        <text fg={C.dim}>5h —</text>
+      ),
+    )
+    groups.push(
+      u ? (
+        <UsageWindowView
+          label="7d"
+          labelColor={C.mauve}
+          w={u.sevenDay}
+          resetText={(ms) => resetDay(ms, now)}
+          dim={stale}
+        />
+      ) : (
+        <text fg={C.dim}>7d —</text>
+      ),
+    )
+    groups.push(
+      <box flexDirection="row" gap={1}>
         <text fg={C.teal}>↓{fmtTok(tot.input + tot.cache.read + tot.cache.write)}</text>
         <text fg={C.peach}>↑{fmtTok(tot.output + tot.reasoning)}</text>
         <text fg={C.yellow}>{fmtCost(cost)}</text>
-        <text fg={busy ? theme().warning : C.dim}>{kids.length} ag</text>
+      </box>,
+    )
+    groups.push(<text fg={busy ? theme().warning : C.dim}>{kids.length} ag</text>)
+    const line: unknown[] = []
+    groups.forEach((g, i) => {
+      if (i > 0) line.push(<Sep />)
+      line.push(g)
+    })
+    return (
+      <box flexDirection="row" gap={1} paddingLeft={1}>
+        {line}
       </box>
     )
   }
